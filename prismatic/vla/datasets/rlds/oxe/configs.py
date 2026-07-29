@@ -134,6 +134,33 @@ OXE_DATASET_CONFIGS = {
         "state_encoding": StateEncoding.NONE,
         "action_encoding": ActionEncoding.EEF_POS,
     },
+    # Black Splat's own MuJoCo/wgpu-rendered demos, converted via
+    # tools/build_rlds_dataset.py from the engine's exported PNG+manifest.jsonl
+    # tuples. Single fixed policy camera (no wrist/secondary view), no
+    # proprioceptive state, EEF delta-pose + gripper action -- same shape as
+    # `roboturk`, which these configs mirror.
+    #
+    # One entry per scene: build_rlds_dataset.py names each scene's dataset
+    # after that scene's own MJCF (black_splat_<scene>, see
+    # `_builder_class_for_scene`), and an unregistered name fails here with a
+    # bare KeyError from materialize.py -- after the 7B model has already
+    # loaded, so it costs a minute of startup to discover. Every scene shares
+    # this identical shape, so adding one is just a name here plus a line in
+    # transforms.py's OXE_STANDARDIZATION_TRANSFORMS.
+    "black_splat_tool_hang": {
+        "image_obs_keys": {"primary": "image", "secondary": None, "wrist": None},
+        "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
+        "state_obs_keys": [None, None, None, None, None, None, None, None],
+        "state_encoding": StateEncoding.NONE,
+        "action_encoding": ActionEncoding.EEF_POS,
+    },
+    "black_splat_panda_lift": {
+        "image_obs_keys": {"primary": "image", "secondary": None, "wrist": None},
+        "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
+        "state_obs_keys": [None, None, None, None, None, None, None, None],
+        "state_encoding": StateEncoding.NONE,
+        "action_encoding": ActionEncoding.EEF_POS,
+    },
     "nyu_door_opening_surprising_effectiveness": {
         "image_obs_keys": {"primary": None, "secondary": None, "wrist": "image"},
         "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},

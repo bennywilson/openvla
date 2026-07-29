@@ -19,6 +19,7 @@ Run with:
                                     ...
 """
 
+import gc
 import os
 from collections import deque
 from dataclasses import dataclass
@@ -37,6 +38,24 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
 from transformers import AutoConfig, AutoImageProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+# `prismatic`'s own `overwatch` module calls `accelerate.PartialState()` (defaulting to the `nccl`
+# backend, which has no Windows build) as a side effect of the `prismatic.models...` imports right
+# below -- before `finetune()` itself even runs. `DistributedDataParallel` further down also
+# requires *some* initialized process group even for a single (world_size=1) process. Rather than
+# patch every `PartialState()` call site, initialize the (no-op, single-process) group here, first,
+# with a `file://` init method -- sidesteps both the missing `nccl` backend and the flaky
+# TCPStore/hostname socket behavior `env://`/`tcp://` init hit on native Windows. Every later
+# `PartialState()` call sees `torch.distributed.is_initialized() == True` and skips its own attempt.
+if os.name == "nt" and not dist.is_initialized():
+    import tempfile
+
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file:///{tempfile.mktemp(prefix='openvla_dist_init_')}",
+        rank=0,
+        world_size=1,
+    )
 
 import wandb
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
@@ -101,6 +120,8 @@ class FinetuneConfig:
     lora_dropout: float = 0.0                                       # Dropout applied to LoRA weights
     use_quantization: bool = False                                  # Whether to 4-bit quantize VLA for LoRA fine-tuning
                                                                     #   => CAUTION: Reduces memory but hurts performance
+    resume_adapter_dir: Optional[Path] = None                       # Existing adapter checkpoint dir to continue
+                                                                    #   training from, instead of a fresh LoRA init
 
     # Tracking Parameters
     wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
@@ -171,18 +192,30 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # [LoRA] Wrap Model w/ PEFT `LoraConfig` =>> by default we set `target_modules=all-linear`
     if cfg.use_lora:
-        lora_config = LoraConfig(
-            r=cfg.lora_rank,
-            lora_alpha=min(cfg.lora_rank, 16),
-            lora_dropout=cfg.lora_dropout,
-            target_modules="all-linear",
-            init_lora_weights="gaussian",
-        )
-        vla = get_peft_model(vla, lora_config)
+        if cfg.resume_adapter_dir is not None:
+            # Continue training the existing adapter (e.g. after a crash) instead of a fresh random init --
+            # `is_trainable=True` is required since `from_pretrained` otherwise loads adapters frozen for inference.
+            vla = PeftModel.from_pretrained(vla, cfg.resume_adapter_dir, is_trainable=True)
+        else:
+            lora_config = LoraConfig(
+                r=cfg.lora_rank,
+                lora_alpha=min(cfg.lora_rank, 16),
+                lora_dropout=cfg.lora_dropout,
+                target_modules="all-linear",
+                init_lora_weights="gaussian",
+            )
+            vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
 
     # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
-    vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
+    #   =>> Single-process (single-GPU) runs skip DDP entirely: there's no gradient sync to do with
+    #       one process, and DDP's reentrant-backward gradient-bucketing (needed for
+    #       `find_unused_parameters`) actively conflicts with this model's gradient checkpointing
+    #       ("Expected to mark a variable ready only once") -- a real interaction bug, not something
+    #       tunable away, so the only correct fix without multiple GPUs is to not wrap at all.
+    if distributed_state.num_processes > 1:
+        vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
+    vla_module = vla.module if isinstance(vla, DDP) else vla
 
     # Create Optimizer =>> note that we default to a simple constant learning rate!
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
@@ -216,7 +249,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         cfg.data_root_dir,
         cfg.dataset_name,
         batch_transform,
-        resize_resolution=tuple(vla.module.config.image_sizes),
+        resize_resolution=tuple(vla_module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
     )
@@ -267,7 +300,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             normalized_loss.backward()
 
             # Compute Accuracy and L1 Loss for Logging
-            action_logits = output.logits[:, vla.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
+            action_logits = output.logits[:, vla_module.vision_backbone.featurizer.patch_embed.num_patches : -1]
             action_preds = action_logits.argmax(dim=2)
             action_gt = batch["labels"][:, 1:].to(action_preds.device)
             mask = action_gt > action_tokenizer.action_token_begin_idx
@@ -300,6 +333,19 @@ def finetune(cfg: FinetuneConfig) -> None:
             smoothened_action_accuracy = sum(recent_action_accuracies) / len(recent_action_accuracies)
             smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)
 
+            # Also echo metrics to stdout, so a run with W&B disabled still leaves a
+            # readable training curve in its log. Without this there is no record of
+            # whether loss fell or `action_accuracy` rose -- the first fine-tune here
+            # was run with WANDB_MODE=disabled and its mode collapse (constant action,
+            # image ignored) therefore went unnoticed until post-hoc evaluation.
+            if distributed_state.is_main_process and gradient_step_idx % 10 == 0:
+                print(
+                    f"[step {gradient_step_idx:>6}] loss={smoothened_loss:.4f} "
+                    f"action_accuracy={smoothened_action_accuracy:.4f} "
+                    f"l1_loss={smoothened_l1_loss:.5f}",
+                    flush=True,
+                )
+
             # Push Metrics to W&B (every 10 gradient steps)
             if distributed_state.is_main_process and gradient_step_idx % 10 == 0:
                 wandb.log(
@@ -317,56 +363,57 @@ def finetune(cfg: FinetuneConfig) -> None:
                 optimizer.zero_grad()
                 progress.update()
 
-            # Save Model Checkpoint =>> by default, only keeps the latest checkpoint, continually overwriting it!
-            if gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0:
-                if distributed_state.is_main_process:
-                    print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
-
-                    # If LoRA, we first save adapter weights, then merge into full model; otherwise, default save!
-                    save_dir = adapter_dir if cfg.use_lora else run_dir
-
-                    # Save Processor & Weights
-                    processor.save_pretrained(run_dir)
-                    vla.module.save_pretrained(save_dir)
-
-                # Wait for processor and adapter weights to be saved by main process
-                dist.barrier()
-
-                # Merge LoRA weights into model backbone for faster inference
-                #   =>> Note that merging is slow and can be done post-hoc to speed up training
-                if cfg.use_lora:
-                    base_vla = AutoModelForVision2Seq.from_pretrained(
-                        cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
-                    )
-                    merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
-                    merged_vla = merged_vla.merge_and_unload()
+                # Save Model Checkpoint =>> by default, only keeps the latest checkpoint, continually overwriting it!
+                #   =>> [Windows/low-RAM fix] The original per-checkpoint merge-into-full-model step below (loading a
+                #       second full-precision 7B copy on CPU while the quantized training model + dataloader are still
+                #       resident) segfaulted this 32GB-RAM machine partway through a real run. Merging is explicitly
+                #       documented upstream as deferrable ("can be done post-hoc to speed up training") -- so every
+                #       periodic checkpoint now only saves the small LoRA adapter (~cheap, no CPU RAM spike); the one
+                #       memory-heavy merge into a standalone full model happens exactly once, after the training loop
+                #       exits, once the training model/optimizer have been freed first.
+                #   =>> Gated behind the same accumulation-boundary check as optimizer.step() above -- gradient_step_idx
+                #       is constant across all grad_accumulation_steps micro-batches in a window, so an ungated check
+                #       here fired once per micro-batch (grad_accumulation_steps redundant saves per checkpoint) using
+                #       the previous step's weights, since it could trigger before this step's optimizer.step() ran.
+                if gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0:
                     if distributed_state.is_main_process:
-                        if cfg.save_latest_checkpoint_only:
-                            # Overwrite latest checkpoint
-                            merged_vla.save_pretrained(run_dir)
+                        print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
 
-                            print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {run_dir}")
-                        else:
-                            # Prepare to save checkpoint in new directory
-                            checkpoint_dir = Path(str(run_dir) + f"--{gradient_step_idx}_chkpt")
-                            os.makedirs(checkpoint_dir, exist_ok=True)
+                        # If LoRA, we first save adapter weights, then merge into full model; otherwise, default save!
+                        save_dir = adapter_dir if cfg.use_lora else run_dir
 
-                            # Save dataset statistics to new directory
-                            save_dataset_statistics(vla_dataset.dataset_statistics, checkpoint_dir)
+                        # Save Processor & Weights
+                        processor.save_pretrained(run_dir)
+                        vla_module.save_pretrained(save_dir)
 
-                            # Save processor and model weights to new directory
-                            processor.save_pretrained(checkpoint_dir)
-                            merged_vla.save_pretrained(checkpoint_dir)
-
-                            print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {checkpoint_dir}")
-
-                # Block on Main Process Checkpointing
-                dist.barrier()
+                    # Wait for processor and adapter weights to be saved by main process
+                    dist.barrier()
 
             # Stop training when max_steps is reached
             if gradient_step_idx == cfg.max_steps:
                 print(f"Max step {cfg.max_steps} reached! Stopping training...")
                 break
+
+    # Merge LoRA weights into model backbone for faster inference =>> done once, post-training, not per-checkpoint
+    #   (see comment above). Free the training model/optimizer first to give the CPU-side reload/merge as much
+    #   headroom as possible.
+    if cfg.use_lora:
+        del vla, optimizer
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        if distributed_state.is_main_process:
+            print("Merging LoRA weights into base model for final checkpoint...")
+        base_vla = AutoModelForVision2Seq.from_pretrained(
+            cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+        )
+        merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
+        merged_vla = merged_vla.merge_and_unload()
+        if distributed_state.is_main_process:
+            merged_vla.save_pretrained(run_dir)
+            print(f"Saved final merged model at: {run_dir}")
+
+        dist.barrier()
 
 
 if __name__ == "__main__":

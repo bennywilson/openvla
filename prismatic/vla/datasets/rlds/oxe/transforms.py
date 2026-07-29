@@ -219,6 +219,26 @@ def roboturk_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     return trajectory
 
 
+def black_splat_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
+    # Shared by every Black Splat scene's dataset (black_splat_<scene>, see
+    # the registry below) -- they all come out of the same exporter, so
+    # there's nothing task-specific to do here.
+    #
+    # `action` and `language_instruction` already come out of
+    # tools/build_rlds_dataset.py in the exact flat/top-level shape this
+    # pipeline wants -- [dx,dy,dz,drx,dry,drz,gripper], gripper 0=open/1=closed
+    # -- so no repacking needed. NOTE: every other OXE dataset's transform
+    # ends up with the opposite gripper polarity (+1=open, 0=closed, see e.g.
+    # `libero_dataset_transform` above) -- this dataset is deliberately left
+    # in its native convention instead, since it's fine-tuned/evaluated solo
+    # (never mixed into a combined OXE run) and its own `unnorm_key` is what
+    # this project's `MujocoScene::apply_policy_action` (src/mujoco.rs)
+    # already expects. Flip this (invert_gripper_actions on trajectory
+    #["action"][..., -1:]) if this dataset is ever folded into a mixture
+    # with other OXE data, since mixture training assumes shared polarity.
+    return trajectory
+
+
 def nyu_door_opening_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     # make gripper action absolute action, +1 = open, 0 = close
     gripper_action = trajectory["action"]["gripper_closedness_action"][:, 0]
@@ -843,6 +863,8 @@ def libero_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
 
 # === Registry ===
 OXE_STANDARDIZATION_TRANSFORMS = {
+    "black_splat_tool_hang": black_splat_dataset_transform,
+    "black_splat_panda_lift": black_splat_dataset_transform,
     "bridge_oxe": bridge_oxe_dataset_transform,
     "bridge_orig": bridge_orig_dataset_transform,
     "bridge_dataset": bridge_orig_dataset_transform,
